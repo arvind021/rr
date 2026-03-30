@@ -15,7 +15,7 @@ class Config:
         self.SESSION1 = getenv("SESSION", None)
         self.SESSION2 = getenv("SESSION2", None)
         self.SESSION3 = getenv("SESSION3", None)
-        self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/+SwNg3pqMEHM5MzFl")
+        self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/fallenx")
         self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/+SwNg3pqMEHM5MzFl")
         self.AUTO_LEAVE: bool = getenv("AUTO_LEAVE", "False").lower() == "true"
         self.AUTO_END: bool = getenv("AUTO_END", "False").lower() == "true"
@@ -24,6 +24,7 @@ class Config:
         self.LANG_CODE = getenv("LANG_CODE", "en")
         self.BABY_API_KEY = getenv("API_KEY")
         self.BABY_BASE_URL = getenv("BASE_URL", "https://babyapi.pro")
+        self.REDIS_URL = getenv("REDIS_URL", "redis://localhost:6379")
         self.COOKIES_URL = [
             url for url in getenv("COOKIES_URL", "").split(" ")
             if url and "batbin.me" in url
