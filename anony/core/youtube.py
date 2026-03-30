@@ -169,7 +169,7 @@ class YouTube:
 
         cookie = self.get_cookies()
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio",
+            ""format": "bestaudio/best"",
             "outtmpl": output,
             "quiet": True,
             "no_warnings": True,
@@ -247,7 +247,7 @@ class YouTube:
         else:
             ydl_opts = {
                 **base_opts,
-                "format": "bestaudio[ext=webm][acodec=opus]",
+                ""format": "bestaudio/best"",
             }
 
         import yt_dlp
