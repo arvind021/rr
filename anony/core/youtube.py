@@ -5,15 +5,15 @@
 
 import os
 import re
-import yt_dlp
 import random
 import asyncio
 import aiohttp
+import redis.asyncio as aioredis
 from pathlib import Path
 
 from py_yt import Playlist, VideosSearch
 
-from anony import logger
+from anony import config, logger
 from anony.helpers import Track, utils
 
 
@@ -110,7 +110,72 @@ class YouTube:
             pass
         return tracks
 
+    async def _baby_get_stream_url(self, video_id: str, video: bool = False) -> str | None:
+        """Fetch stream URL from BabyAPI with Redis cache."""
+        api_key = config.BABY_API_KEY
+        base_url = config.BABY_BASE_URL
+        endpoint = "video" if video else "song"
+        cache_key = f"baby:{'video' if video else 'audio'}:{video_id}"
+
+        try:
+            redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
+
+            # Check cache first
+            cached = await redis.get(cache_key)
+            if cached:
+                logger.info(f"BabyAPI cache hit for {video_id}")
+                await redis.aclose()
+                return cached
+
+            async with aiohttp.ClientSession() as session:
+                # Step 1: Get token and file_id
+                async with session.get(
+                    f"{base_url}/api/{endpoint}",
+                    params={"query": video_id, "api": api_key},
+                    headers={"x-api-key": api_key},
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"BabyAPI {endpoint} returned {resp.status}")
+                        await redis.aclose()
+                        return None
+                    data = await resp.json()
+
+            token = data.get("token")
+            file_id = data.get("file_id") or data.get("id")
+
+            if not token or not file_id:
+                logger.warning(f"BabyAPI missing token/file_id: {data}")
+                await redis.aclose()
+                return None
+
+            # Step 2: Build stream URL
+            stream_url = (
+                f"{base_url}/api/stream/{file_id}"
+                f"?token={token}&api={api_key}"
+            )
+
+            # Cache for 1 hour
+            await redis.set(cache_key, stream_url, ex=3600)
+            await redis.aclose()
+            return stream_url
+
+        except Exception as ex:
+            logger.warning(f"BabyAPI error: {ex}")
+            return None
+
     async def download(self, video_id: str, video: bool = False) -> str | None:
+        # Try BabyAPI first
+        stream_url = await self._baby_get_stream_url(video_id, video)
+        if stream_url:
+            logger.info(f"BabyAPI stream URL fetched for {video_id}")
+            return stream_url
+
+        # Fallback: yt-dlp
+        logger.warning(f"BabyAPI failed for {video_id}, falling back to yt-dlp")
+        return await self._ytdlp_download(video_id, video)
+
+    async def _ytdlp_download(self, video_id: str, video: bool = False) -> str | None:
+        import yt_dlp
         url = self.base + video_id
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
