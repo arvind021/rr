@@ -64,6 +64,13 @@ class TgCall(PyTgCalls):
         # Support both local file paths and HTTP stream URLs (BabyAPI)
         is_url = media.file_path.startswith("http://") or media.file_path.startswith("https://")
 
+        if is_url:
+            ffmpeg_params = "-probesize 32 -analyzeduration 0"
+            if seek_time > 1:
+                ffmpeg_params += f" -ss {seek_time}"
+        else:
+            ffmpeg_params = f"-ss {seek_time}" if seek_time > 1 else None
+
         stream = types.MediaStream(
             media_path=media.file_path,
             audio_parameters=types.AudioQuality.HIGH,
@@ -74,7 +81,7 @@ class TgCall(PyTgCalls):
                 if media.video
                 else types.MediaStream.Flags.IGNORE
             ),
-            ffmpeg_parameters=f"-ss {seek_time}" if seek_time > 1 else None,
+            ffmpeg_parameters=ffmpeg_params,
         )
         try:
             await client.play(
