@@ -120,15 +120,14 @@ class YouTube:
         try:
             redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
 
-            # Check cache first
+            # Check Redis cache first
             cached = await redis.get(cache_key)
             if cached:
-                logger.info(f"BabyAPI cache hit for {video_id}")
+                logger.info(f"BabyAPI Redis cache hit for {video_id}")
                 await redis.aclose()
                 return cached
 
             async with aiohttp.ClientSession() as session:
-                # Step 1: Get token and file_id
                 async with session.get(
                     f"{base_url}/api/{endpoint}",
                     params={"query": video_id, "api": api_key},
@@ -141,15 +140,16 @@ class YouTube:
                     data = await resp.json()
 
             stream_url = data.get("stream")
-
             if not stream_url:
                 logger.warning(f"BabyAPI missing stream URL: {data}")
                 await redis.aclose()
                 return None
 
-            # Cache for 1 hour
+            # Cache URL for 1 hour
             await redis.set(cache_key, stream_url, ex=3600)
             await redis.aclose()
+
+            logger.info(f"BabyAPI stream URL fetched for {video_id}")
             return stream_url
 
         except Exception as ex:
