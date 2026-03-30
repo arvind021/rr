@@ -61,6 +61,9 @@ class TgCall(PyTgCalls):
             await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
             return await self.play_next(chat_id)
 
+        # Support both local file paths and HTTP stream URLs (BabyAPI)
+        is_url = media.file_path.startswith("http://") or media.file_path.startswith("https://")
+
         stream = types.MediaStream(
             media_path=media.file_path,
             audio_parameters=types.AudioQuality.HIGH,
@@ -116,8 +119,10 @@ class TgCall(PyTgCalls):
                         )
                     media.message_id = sent.id
         except FileNotFoundError:
-            await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
-            await self.play_next(chat_id)
+            # Only for local files, not URLs
+            if not is_url:
+                await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
+                await self.play_next(chat_id)
         except exceptions.NoActiveGroupCall:
             await self.stop(chat_id)
             await message.edit_text(_lang["error_no_call"])
