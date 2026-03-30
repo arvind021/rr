@@ -20,6 +20,9 @@ from anony.helpers import Track, utils
 CACHE_DIR = "anony/cache/audio"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Ek saath max 3 download (overload nahi hoga)
+_download_semaphore = asyncio.Semaphore(3)
+
 
 class YouTube:
     def __init__(self):
@@ -115,7 +118,7 @@ class YouTube:
         return tracks
 
     async def _baby_get_stream_url(self, video_id: str, video: bool = False) -> str | None:
-        """Fetch stream URL from BabyAPI with Redis cache."""
+        """Fetch stream URL from BabyAPI with Redis cache + retry logic."""
         api_key = config.BABY_API_KEY
         base_url = config.BABY_BASE_URL
         endpoint = "video" if video else "song"
@@ -124,32 +127,44 @@ class YouTube:
         try:
             redis = aioredis.from_url(config.REDIS_URL, decode_responses=True)
 
-            # Check Redis cache first
+            # Redis cache check
             cached = await redis.get(cache_key)
             if cached:
                 logger.info(f"BabyAPI Redis cache hit for {video_id}")
                 await redis.aclose()
                 return cached
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{base_url}/api/{endpoint}",
-                    params={"query": video_id, "api": api_key},
-                    headers={"x-api-key": api_key},
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"BabyAPI {endpoint} returned {resp.status}")
-                        await redis.aclose()
-                        return None
-                    data = await resp.json()
+            # BabyAPI fetch — 3 retries
+            stream_url = None
+            for attempt in range(3):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"{base_url}/api/{endpoint}",
+                            params={"query": video_id, "api": api_key},
+                            headers={"x-api-key": api_key},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            if resp.status != 200:
+                                logger.warning(f"BabyAPI attempt {attempt+1} returned {resp.status}")
+                                await asyncio.sleep(1)
+                                continue
+                            data = await resp.json()
+                            stream_url = data.get("stream")
+                            if stream_url:
+                                break
+                except asyncio.TimeoutError:
+                    logger.warning(f"BabyAPI timeout attempt {attempt+1} for {video_id}")
+                    await asyncio.sleep(1)
+                except Exception as ex:
+                    logger.warning(f"BabyAPI attempt {attempt+1} error: {ex}")
+                    await asyncio.sleep(1)
 
-            stream_url = data.get("stream")
             if not stream_url:
-                logger.warning(f"BabyAPI missing stream URL: {data}")
                 await redis.aclose()
                 return None
 
-            # Cache URL for 1 hour
+            # Redis mein 1 hour cache
             await redis.set(cache_key, stream_url, ex=3600)
             await redis.aclose()
 
@@ -160,33 +175,40 @@ class YouTube:
             logger.warning(f"BabyAPI error: {ex}")
             return None
 
-    async def _cache_audio(self, video_id: str) -> None:
-        """Background mein audio download karo local cache ke liye."""
-        import yt_dlp
+    async def _cache_audio(self, video_id: str, stream_url: str) -> None:
+        """
+        BabyAPI stream URL se directly download karo local cache mein.
+        YouTube pe koi hit nahi — no rate limit risk.
+        """
         output = f"{CACHE_DIR}/{video_id}.m4a"
         if Path(output).exists():
             return
 
-        cookie = self.get_cookies()
-        ydl_opts = {
-            ""format": "bestaudio/best"",
-            "outtmpl": output,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 15,
-            "cookiefile": cookie,
-        }
-        try:
-            await asyncio.to_thread(
-                lambda: yt_dlp.YoutubeDL(ydl_opts).download(
-                    [f"https://www.youtube.com/watch?v={video_id}"]
-                )
-            )
-            logger.info(f"Cached audio locally: {video_id}")
-        except Exception as ex:
-            logger.warning(f"Cache download failed: {ex}")
-            if Path(output).exists():
-                Path(output).unlink()  # incomplete file delete
+        async with _download_semaphore:  # max 3 concurrent downloads
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        stream_url,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"Cache download failed, status {resp.status}: {video_id}")
+                            return
+
+                        with open(output, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(64 * 1024):
+                                f.write(chunk)
+
+                logger.info(f"Cached audio via BabyAPI stream: {video_id}")
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Cache download timeout: {video_id}")
+                if Path(output).exists():
+                    Path(output).unlink()
+            except Exception as ex:
+                logger.warning(f"Cache download error: {ex}")
+                if Path(output).exists():
+                    Path(output).unlink()
 
     async def download(self, video_id: str, video: bool = False) -> str | None:
         # Layer 1: Local file check (instant ⚡)
@@ -200,25 +222,28 @@ class YouTube:
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url:
             logger.info(f"BabyAPI stream URL fetched for {video_id}")
-            # Background mein download karo (sirf audio ke liye)
+            # BabyAPI stream se background download (sirf audio)
             if not video:
-                asyncio.create_task(self._cache_audio(video_id))
+                asyncio.create_task(self._cache_audio(video_id, stream_url))
             return stream_url
 
-        # Layer 3: yt-dlp fallback
+        # Layer 3: yt-dlp fallback (last resort)
         logger.warning(f"BabyAPI failed for {video_id}, falling back to yt-dlp")
         return await self._ytdlp_download(video_id, video)
 
     async def prefetch(self, video_id: str, video: bool = False) -> None:
-        """Next song pehle se ready karo background mein."""
+        """Next song pehle se background mein ready karo."""
         if not video and Path(f"{CACHE_DIR}/{video_id}.m4a").exists():
             return  # already cached hai
 
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url and not video:
-            asyncio.create_task(self._cache_audio(video_id))
+            asyncio.create_task(self._cache_audio(video_id, stream_url))
 
     async def _ytdlp_download(self, video_id: str, video: bool = False) -> str | None:
+        """Last resort fallback — sirf tab jab BabyAPI fail ho."""
+        import yt_dlp
+
         url = self.base + video_id
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
@@ -247,10 +272,8 @@ class YouTube:
         else:
             ydl_opts = {
                 **base_opts,
-                ""format": "bestaudio/best"",
+                "format": "bestaudio[ext=webm][acodec=opus]",
             }
-
-        import yt_dlp
 
         def _download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -264,3 +287,4 @@ class YouTube:
             return filename
 
         return await asyncio.to_thread(_download)
+    
