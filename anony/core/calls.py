@@ -188,6 +188,12 @@ class TgCall(PyTgCalls):
         media.message_id = msg.id
         await self.play_media(chat_id, msg, media)
 
+        # Next song prefetch — background mein ready karo ⚡
+        import asyncio
+        next_media = queue.get_next(chat_id)
+        if next_media and not next_media.file_path:
+            asyncio.create_task(yt.prefetch(next_media.id, next_media.video))
+
 
     async def ping(self) -> float:
         pings = [client.ping for client in self.clients]
