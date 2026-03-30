@@ -15,8 +15,8 @@ class Config:
         self.SESSION1 = getenv("SESSION", None)
         self.SESSION2 = getenv("SESSION2", None)
         self.SESSION3 = getenv("SESSION3", None)
-        self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/fallenx")
-        self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/+SwNg3pqMEHM5MzFl")
+        self.SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/+dZCL9T23szs5MzVl")
+        self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/+dZCL9T23szs5MzVl")
         self.AUTO_LEAVE: bool = getenv("AUTO_LEAVE", "False").lower() == "true"
         self.AUTO_END: bool = getenv("AUTO_END", "False").lower() == "true"
         self.THUMB_GEN: bool = getenv("THUMB_GEN", "True").lower() == "true"
