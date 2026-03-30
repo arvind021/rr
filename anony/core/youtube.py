@@ -17,6 +17,10 @@ from anony import config, logger
 from anony.helpers import Track, utils
 
 
+CACHE_DIR = "anony/cache/audio"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
 class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
@@ -156,19 +160,65 @@ class YouTube:
             logger.warning(f"BabyAPI error: {ex}")
             return None
 
+    async def _cache_audio(self, video_id: str) -> None:
+        """Background mein audio download karo local cache ke liye."""
+        import yt_dlp
+        output = f"{CACHE_DIR}/{video_id}.m4a"
+        if Path(output).exists():
+            return
+
+        cookie = self.get_cookies()
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio",
+            "outtmpl": output,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 15,
+            "cookiefile": cookie,
+        }
+        try:
+            await asyncio.to_thread(
+                lambda: yt_dlp.YoutubeDL(ydl_opts).download(
+                    [f"https://www.youtube.com/watch?v={video_id}"]
+                )
+            )
+            logger.info(f"Cached audio locally: {video_id}")
+        except Exception as ex:
+            logger.warning(f"Cache download failed: {ex}")
+            if Path(output).exists():
+                Path(output).unlink()  # incomplete file delete
+
     async def download(self, video_id: str, video: bool = False) -> str | None:
-        # Try BabyAPI first
+        # Layer 1: Local file check (instant ⚡)
+        if not video:
+            cached = f"{CACHE_DIR}/{video_id}.m4a"
+            if Path(cached).exists():
+                logger.info(f"Local cache hit: {video_id}")
+                return cached
+
+        # Layer 2: BabyAPI (Redis cached ⚡⚡)
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url:
             logger.info(f"BabyAPI stream URL fetched for {video_id}")
+            # Background mein download karo (sirf audio ke liye)
+            if not video:
+                asyncio.create_task(self._cache_audio(video_id))
             return stream_url
 
-        # Fallback: yt-dlp
+        # Layer 3: yt-dlp fallback
         logger.warning(f"BabyAPI failed for {video_id}, falling back to yt-dlp")
         return await self._ytdlp_download(video_id, video)
 
+    async def prefetch(self, video_id: str, video: bool = False) -> None:
+        """Next song pehle se ready karo background mein."""
+        if not video and Path(f"{CACHE_DIR}/{video_id}.m4a").exists():
+            return  # already cached hai
+
+        stream_url = await self._baby_get_stream_url(video_id, video)
+        if stream_url and not video:
+            asyncio.create_task(self._cache_audio(video_id))
+
     async def _ytdlp_download(self, video_id: str, video: bool = False) -> str | None:
-        import yt_dlp
         url = self.base + video_id
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
@@ -199,6 +249,8 @@ class YouTube:
                 **base_opts,
                 "format": "bestaudio[ext=webm][acodec=opus]",
             }
+
+        import yt_dlp
 
         def _download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
