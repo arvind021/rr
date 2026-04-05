@@ -164,8 +164,8 @@ class YouTube:
                 await redis.aclose()
                 return None
 
-            # Redis mein 1 hour cache
-            await redis.set(cache_key, stream_url, ex=3600)
+            # Redis mein 20 min cache (1 hour se kam — URL expire hone se pehle)
+            await redis.set(cache_key, stream_url, ex=1200)
             await redis.aclose()
 
             logger.info(f"BabyAPI stream URL fetched for {video_id}")
@@ -175,22 +175,59 @@ class YouTube:
             logger.warning(f"BabyAPI error: {ex}")
             return None
 
-    async def _cache_audio(self, video_id: str, stream_url: str) -> None:
-        """
-        BabyAPI stream URL se directly download karo local cache mein.
-        YouTube pe koi hit nahi — no rate limit risk.
-        """
+    def _ytdlp_cache(self, video_id: str) -> None:
+        """Sync yt-dlp download for cache — 423 pe fallback."""
+        import yt_dlp
         output = f"{CACHE_DIR}/{video_id}.m4a"
         if Path(output).exists():
             return
 
-        async with _download_semaphore:  # max 3 concurrent downloads
+        cookie = self.get_cookies()
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": output,
+            "quiet": True,
+            "no_warnings": True,
+            "cookiefile": cookie,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            logger.info(f"Cached via yt-dlp: {video_id}")
+        except Exception as ex:
+            logger.warning(f"yt-dlp cache failed: {ex}")
+            if Path(output).exists():
+                Path(output).unlink()
+
+    async def _cache_audio(self, video_id: str, stream_url: str) -> None:
+        """
+        BabyAPI stream URL se directly download karo local cache mein.
+        423 aaye toh yt-dlp se cache karo.
+        Lock file se duplicate download prevent.
+        """
+        output = f"{CACHE_DIR}/{video_id}.m4a"
+        lock = f"{CACHE_DIR}/{video_id}.lock"
+
+        # Already downloaded ya downloading hai?
+        if Path(output).exists() or Path(lock).exists():
+            return
+
+        # Lock banao
+        Path(lock).touch()
+
+        async with _download_semaphore:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         stream_url,
                         timeout=aiohttp.ClientTimeout(total=120),
                     ) as resp:
+                        if resp.status == 423:
+                            # Direct download allowed nahi — yt-dlp se karo
+                            logger.info(f"423 Locked, switching to yt-dlp cache: {video_id}")
+                            await asyncio.to_thread(self._ytdlp_cache, video_id)
+                            return
+
                         if resp.status != 200:
                             logger.warning(f"Cache download failed, status {resp.status}: {video_id}")
                             return
@@ -209,6 +246,9 @@ class YouTube:
                 logger.warning(f"Cache download error: {ex}")
                 if Path(output).exists():
                     Path(output).unlink()
+            finally:
+                # Lock hamesha delete karo
+                Path(lock).unlink(missing_ok=True)
 
     async def download(self, video_id: str, video: bool = False) -> str | None:
         # Layer 1: Local file check (instant ⚡)
@@ -222,9 +262,12 @@ class YouTube:
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url:
             logger.info(f"BabyAPI stream URL fetched for {video_id}")
-            # BabyAPI stream se background download (sirf audio)
+            # Background download — lock se duplicate prevent
             if not video:
-                asyncio.create_task(self._cache_audio(video_id, stream_url))
+                cached = f"{CACHE_DIR}/{video_id}.m4a"
+                lock = f"{CACHE_DIR}/{video_id}.lock"
+                if not Path(cached).exists() and not Path(lock).exists():
+                    asyncio.create_task(self._cache_audio(video_id, stream_url))
             return stream_url
 
         # Layer 3: yt-dlp fallback (last resort)
@@ -234,18 +277,21 @@ class YouTube:
     async def prefetch(self, video_id: str, video: bool = False) -> None:
         """Next song pehle se background mein ready karo."""
         if not video and Path(f"{CACHE_DIR}/{video_id}.m4a").exists():
-            return  # already cached hai
+            return
 
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url and not video:
-            asyncio.create_task(self._cache_audio(video_id, stream_url))
+            cached = f"{CACHE_DIR}/{video_id}.m4a"
+            lock = f"{CACHE_DIR}/{video_id}.lock"
+            if not Path(cached).exists() and not Path(lock).exists():
+                asyncio.create_task(self._cache_audio(video_id, stream_url))
 
     async def _ytdlp_download(self, video_id: str, video: bool = False) -> str | None:
         """Last resort fallback — sirf tab jab BabyAPI fail ho."""
         import yt_dlp
 
         url = self.base + video_id
-        ext = "mp4" if video else "webm"
+        ext = "mp4" if video else "m4a"
         filename = f"downloads/{video_id}.{ext}"
 
         if Path(filename).exists():
@@ -272,7 +318,7 @@ class YouTube:
         else:
             ydl_opts = {
                 **base_opts,
-                "format": "bestaudio[ext=webm][acodec=opus]",
+                "format": "bestaudio/best",  # FIX: webm opus se change kiya
             }
 
         def _download():
@@ -287,4 +333,4 @@ class YouTube:
             return filename
 
         return await asyncio.to_thread(_download)
-    
+        
