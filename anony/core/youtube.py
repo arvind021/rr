@@ -164,11 +164,10 @@ class YouTube:
                 await redis.aclose()
                 return None
 
-            # Redis mein 20 min cache (1 hour se kam — URL expire hone se pehle)
+            # Redis mein 20 min cache
             await redis.set(cache_key, stream_url, ex=1200)
             await redis.aclose()
 
-            logger.info(f"BabyAPI stream URL fetched for {video_id}")
             return stream_url
 
         except Exception as ex:
@@ -184,8 +183,9 @@ class YouTube:
 
         cookie = self.get_cookies()
         ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": output,
+            # ✅ Format fallback chain — strict format se "not available" error nahi aayega
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "outtmpl": f"{CACHE_DIR}/{video_id}.%(ext)s",  # ✅ dynamic extension
             "quiet": True,
             "no_warnings": True,
             "cookiefile": cookie,
@@ -193,11 +193,21 @@ class YouTube:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+            # ✅ Downloaded file ko .m4a rename karo agar different ext hai
+            for ext in ["webm", "opus", "ogg"]:
+                src = Path(f"{CACHE_DIR}/{video_id}.{ext}")
+                if src.exists():
+                    src.rename(output)
+                    break
+
             logger.info(f"Cached via yt-dlp: {video_id}")
         except Exception as ex:
             logger.warning(f"yt-dlp cache failed: {ex}")
-            if Path(output).exists():
-                Path(output).unlink()
+            for ext in ["m4a", "webm", "opus", "ogg"]:
+                p = Path(f"{CACHE_DIR}/{video_id}.{ext}")
+                if p.exists():
+                    p.unlink()
 
     async def _cache_audio(self, video_id: str, stream_url: str) -> None:
         """
@@ -223,7 +233,6 @@ class YouTube:
                         timeout=aiohttp.ClientTimeout(total=120),
                     ) as resp:
                         if resp.status == 423:
-                            # Direct download allowed nahi — yt-dlp se karo
                             logger.info(f"423 Locked, switching to yt-dlp cache: {video_id}")
                             await asyncio.to_thread(self._ytdlp_cache, video_id)
                             return
@@ -247,7 +256,6 @@ class YouTube:
                 if Path(output).exists():
                     Path(output).unlink()
             finally:
-                # Lock hamesha delete karo
                 Path(lock).unlink(missing_ok=True)
 
     async def download(self, video_id: str, video: bool = False) -> str | None:
@@ -258,17 +266,29 @@ class YouTube:
                 logger.info(f"Local cache hit: {video_id}")
                 return cached
 
-        # Layer 2: BabyAPI (Redis cached ⚡⚡)
+        # Layer 2: BabyAPI — URL milne ke baad verify karo (HEAD request)
         stream_url = await self._baby_get_stream_url(video_id, video)
         if stream_url:
-            logger.info(f"BabyAPI stream URL fetched for {video_id}")
-            # Background download — lock se duplicate prevent
-            if not video:
-                cached = f"{CACHE_DIR}/{video_id}.m4a"
-                lock = f"{CACHE_DIR}/{video_id}.lock"
-                if not Path(cached).exists() and not Path(lock).exists():
-                    asyncio.create_task(self._cache_audio(video_id, stream_url))
-            return stream_url
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(
+                        stream_url,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status in (200, 206, 301, 302):
+                            logger.info(f"BabyAPI stream verified for {video_id}")
+                            # Background cache karo
+                            if not video:
+                                cached = f"{CACHE_DIR}/{video_id}.m4a"
+                                lock = f"{CACHE_DIR}/{video_id}.lock"
+                                if not Path(cached).exists() and not Path(lock).exists():
+                                    asyncio.create_task(self._cache_audio(video_id, stream_url))
+                            return stream_url
+                        else:
+                            logger.warning(f"BabyAPI URL dead ({resp.status}), falling back: {video_id}")
+            except Exception as ex:
+                logger.warning(f"BabyAPI URL verify failed: {ex}, falling back: {video_id}")
 
         # Layer 3: yt-dlp fallback (last resort)
         logger.warning(f"BabyAPI failed for {video_id}, falling back to yt-dlp")
@@ -318,7 +338,8 @@ class YouTube:
         else:
             ydl_opts = {
                 **base_opts,
-                "format": "bestaudio/best",  # FIX: webm opus se change kiya
+                # ✅ Fallback chain — "format not available" error nahi aayega
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             }
 
         def _download():
@@ -330,7 +351,15 @@ class YouTube:
                 except Exception as ex:
                     logger.warning("Download failed: %s", ex)
                     return None
-            return filename
+
+            # ✅ Actual downloaded file dhundo (ext alag ho sakti hai)
+            for actual_ext in ["m4a", "webm", "opus", "ogg", "mp3"]:
+                actual = f"downloads/{video_id}.{actual_ext}"
+                if Path(actual).exists():
+                    if actual_ext != ext:
+                        Path(actual).rename(filename)
+                    return filename
+            return None
 
         return await asyncio.to_thread(_download)
-        
+            
